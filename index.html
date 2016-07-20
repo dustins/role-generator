@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Role Generator</title>
+    <script src="js/aws-sdk-s3-iam.js"></script>
+
+    <style type="text/css">
+        body {
+            font-family: monospace;
+        }
+
+        #accessCredentials, #assumeRolePolicy {
+            width: 50%;
+            height: 40px;
+        }
+    </style>
+</head>
+<body>
+
+<h1>Role Generator</h1>
+
+<form id="roleForm">
+    <div>
+        <label for="accessCredentials"><strong>Access Credentials:</strong></label><br />
+        <textarea id="accessCredentials"></textarea>
+    </div>
+
+    <div>
+        <label for="assumeRolePolicy"><strong>Assume Role Policy:</strong></label><br />
+        <textarea id="assumeRolePolicy"></textarea>
+    </div>
+
+    <div>
+        <input type="submit" value="Update Roles" />
+    </div>
+</form>
+
+<script>
+    document.getElementById("roleForm").addEventListener("submit", function (event) {
+        event.preventDefault();
+
+        var CREDENTIALS = JSON.parse(document.getElementById("accessCredentials").value);
+        var ASSUME_ROLE_POLICY_DOC = document.getElementById("assumeRolePolicy").value;
+
+        // configure AWS
+        AWS.config.credentials = new AWS.Credentials(CREDENTIALS.accessKeyId, CREDENTIALS.secretAccessKey);
+        AWS.config.region = 'us-east-1';
+        AWS.config.logger = console;
+
+        // declare our services
+        var s3 = new AWS.S3();
+        var iam = new AWS.IAM();
+
+        /**
+         * A wrapper so that we can both reduce boilerplate code and wrap AWS calls in a Promise
+         * @param thisArg
+         * @param func
+         * @param args
+         * @returns {Promise}
+         */
+        var promiseResolver = function (thisArg, func, args) {
+            return new Promise(function (resolve, reject) {
+                var promiseHandler = function (error, data) {
+                    if (error) {
+                        reject(error);
+                    } else {
+                        resolve(data);
+                    }
+                };
+
+                args = args || [];
+                args.push(promiseHandler);
+                func.apply(thisArg, args);
+            });
+        };
+
+        var failedPromise = function (error) {
+            alert("Unable to create roles, please see the console.");
+            console.log(error);
+        };
+
+
+        var listRoles = promiseResolver(iam, iam.listRoles);
+        var listObjects = promiseResolver(s3, s3.listObjectsV2, [{
+            Bucket: 'roles-bucket'
+        }]);
+
+        Promise.all([listRoles, listObjects]).then(function (arguments) {
+            var rolesBucket = arguments[1];
+            var roleNames = arguments[0].Roles.map(function (item) {
+                return item.RoleName;
+            });
+
+            var roleUpdatePromises = [];
+            rolesBucket.Contents.forEach(function (item, index) {
+                var roleName = item.Key.replace(/\.json/, '');
+
+                // create or update role
+                var roleUpdate = null;
+                if (roleNames.indexOf(roleName) == -1) {
+                    roleUpdate = promiseResolver(iam, iam.createRole, [{
+                        RoleName: roleName,
+                        AssumeRolePolicyDocument: ASSUME_ROLE_POLICY_DOC
+                    }]);
+                } else {
+                    roleUpdate = promiseResolver(iam, iam.updateAssumeRolePolicy, [{
+                        RoleName: roleName,
+                        PolicyDocument: ASSUME_ROLE_POLICY_DOC
+                    }]);
+                }
+
+                roleUpdatePromises.push(roleUpdate);
+            });
+
+            // wait for all roles to be created/updated before putting role policies
+            Promise.all(roleUpdatePromises).then(function () {
+                rolesBucket.Contents.forEach(function (item, index) {
+                    var roleName = item.Key.replace(/\.json/, '');
+
+                    var getObject = promiseResolver(s3, s3.getObject, [{
+                        Bucket: rolesBucket.Name,
+                        Key: item.Key
+                    }]);
+
+                    getObject.then(function (object) {
+                        var policyDocument = object.Body.toString('utf-8');
+
+                        var putRolePolicy = promiseResolver(iam, iam.putRolePolicy, [{
+                            PolicyDocument: policyDocument,
+                            PolicyName: roleName,
+                            RoleName: roleName
+                        }]);
+                    }).catch(failedPromise);
+                });
+            }).catch(failedPromise);
+        }).catch(failedPromise);
+    });
+</script>
+</body>
+</html>
